@@ -26,6 +26,7 @@
 | `src/session_broker/policy.py` | 红线硬门 `check_activation`（无评审拒 / 无记录拒 / vendor 不符拒 / 未批准拒 / **>90 天过期拒**）+ `ReviewStore`（ToS 评审记录册，90 天有效） |
 | `src/session_broker/audit.py` | append-only 审计事件（register/activate/revoke/deny/expire），每事件含 actor/subject/reason/ts，可选 JSONL sink |
 | `src/session_broker/api.py` | stdlib `http.server` 最小 REST：`GET /health`、`GET/POST /sessions`、`POST /sessions/{id}/activate`、`POST /sessions/{id}/revoke`、`POST /reviews`；JSON 错误体；**请求日志只记字段名不记值** |
+| `providers/zcode/` | ZCode CLI provider（spawn 家族）+ B-1 本地 OpenAI 兼容 HTTP 壳 + pytest（全 mock）；真实调用与配额待遇证据见其 README 文末 |
 | `docs/relay-design.md` | Higress 出站中继设计草案：transform 插件槽（归一化/计量）、伪装能力默认禁用、逐家 ToS 评审清单模板——**只设计不实现** |
 | `tests/` | pytest：红线门 ≥6 类拒绝路径 + 幂等 + 到期 + API dispatch 分支 + 真实端口端到端 + 日志不泄值 |
 
