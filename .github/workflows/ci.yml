@@ -1,0 +1,35 @@
+# session-broker CI 门禁（D1 修复：此前本仓 106 例回归无任何自动门禁）。
+# 元资产纪律（PROP-0001 v2.1 §11/§14）：本文件改动强制 owner PR 审（zizmor 常开）。
+# 口径：仓根裸 pytest 全量，floor 断言随上游如实核查回填（只升不降，不许静默放行）；
+# 当前 floor=106 对应 main=e60c0dd 本地实测 106 passed。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install pytest -e .
+      - name: pytest with floor
+        run: |
+          set -e
+          python -m pytest > pytest.log 2>&1 || { tail -30 pytest.log; exit 1; }
+          tail -3 pytest.log
+          N="$(grep -oE '[0-9]+ passed' pytest.log | tail -1 | grep -oE '[0-9]+')"
+          [ -n "$N" ] || { echo "cannot parse passed count"; tail -30 pytest.log; exit 1; }
+          [ "$N" -ge 106 ] || { echo "passed=$N < 106 (upstream changed? re-verify and re-ratchet, never silently loosen)"; exit 1; }
+          echo "session-broker floor OK: $N passed (>= 106)"
