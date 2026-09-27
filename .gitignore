@@ -34,3 +34,6 @@ venv/
 
 # ---- Node ----
 node_modules/
+
+# ---- qoder provider runtime logs (WO D-01) ----
+providers/qoder/logs/
