@@ -47,14 +47,19 @@ def _iso(dt):
 
 
 class BrokerApp:
-    """把 registry/policy/audit 装配为一个可独立测试的应用层（dispatch 为纯函数）。"""
+    """把 registry/policy/audit 装配为一个可独立测试的应用层（dispatch 为纯函数）。
 
-    def __init__(self, clock=None):
+    ``broker_health``：可选 :class:`session_broker.broker.health.BrokerHealth`，
+    提供后暴露 ``GET /broker/health``（cell / 刷新调度器只读快照）。
+    """
+
+    def __init__(self, clock=None, broker_health=None):
         self._clock = clock or _default_clock
         self.audit = AuditLog(clock=self._clock)
         self.reviews = ReviewStore()
         self.registry = SessionRegistry(gate=self._gate, audit=self.audit,
                                         clock=self._clock)
+        self.broker_health = broker_health
 
     def _gate(self, session):
         return check_activation(session, self.reviews, self._clock())
@@ -67,6 +72,8 @@ class BrokerApp:
         try:
             if path == "/health":
                 return self._health(method)
+            if path == "/broker/health":
+                return self._broker_health(method)
             if path == "/sessions":
                 if method == "GET":
                     return self._list_sessions(query)
@@ -96,6 +103,14 @@ class BrokerApp:
         if method != "GET":
             return self._err(405, "METHOD_NOT_ALLOWED", "%s /health" % method)
         return 200, {"status": "ok", "redline": REDLINE_TEXT, "time": _iso(self._clock())}
+
+    def _broker_health(self, method):
+        if method != "GET":
+            return self._err(405, "METHOD_NOT_ALLOWED", "%s /broker/health" % method)
+        if self.broker_health is None:
+            return self._err(501, "BROKER_HEALTH_NOT_CONFIGURED",
+                             "no broker runtime registered with this app")
+        return 200, self.broker_health.snapshot()
 
     def _list_sessions(self, query):
         state = query.get("state")
