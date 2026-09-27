@@ -44,6 +44,35 @@ srv.serve_forever()
 
 零第三方依赖：Python 3.9+ 标准库即可运行。
 
+## broker/ 运行时框架（vendor 无关，首版）
+
+治理壳管"**能不能用**"（红线门/登记册/审计），`src/session_broker/broker/` 管"**怎么安全地续着用**"：
+
+| 组件 | 说明 |
+| --- | --- |
+| `broker/clock.py` | `Clock`/`SystemClock`/`MockClock`——调度全部经时钟注入，可压缩时间仿真 |
+| `broker/cell.py` | `CredentialCell`：目录即隔离边界 + 按 cell 命名的 leader socket + **仅引用**的元数据（凭据值零落盘）+ 0600 等价 ACL |
+| `broker/scheduler.py` | `RefreshScheduler`：**刷新提前量 < TTL 构造级硬约束**（防"一出生就在刷新窗口"死循环）、401 新铸即拒 30s 环路保护、1→60s 有界退避 |
+| `broker/audit.py` | `CredentialAudit`：字段白名单 + `key_prefix` 指纹化（sha256 前 12 位 + 长度）；键名含 token/secret 直接拒收；append-only |
+| `broker/minting.py` | 外部认证提供者 stdout 铸币契约（单行 token 或单行 JSON）+ `FakeCredentialSource`（FAKE-only）+ 契约违规解析拒绝 |
+| `broker/health.py` | `BrokerHealth`：cell/调度器只读快照 → `GET /broker/health`（未配置返回 501） |
+| `broker/simulate.py` | `run_refresh_cycle`：MockClock 驱动的长周期刷新仿真，窗口/间隔/提前量三条不变量逐条断言 |
+
+**vendor 边界**：各厂商的专属适配（配置注入点、home 变量、leader 参数、登录流程）不在本仓——
+vendor adapter 在私有运维仓实现（例：grok vendor adapter 见私有仓；
+红线=**不得违反订阅条款使用 OAuth 会话**）。本仓只定义 adapter 必须遵守的抽象与契约。
+
+7 天 TTL 压缩验证（无真实登录，毫秒级）::
+
+    from session_broker.broker import (MockClock, RefreshScheduler,
+                                       FakeCredentialSource, run_refresh_cycle)
+    clk = MockClock(start=1_700_000_000.0)
+    sched = RefreshScheduler(ttl_seconds=7*86400, lead_seconds=300, clock=clk)
+    src = FakeCredentialSource(expires_in=7*86400, clock=clk)
+    report = run_refresh_cycle(sched, clk, src, total_seconds=70*86400)
+    assert len(report.refresh_epochs) == 10   # 70 天 / 7 天，每次都落在窗口内
+
+
 ## 会话状态机
 
 ```
