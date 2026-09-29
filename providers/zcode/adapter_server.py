@@ -12,6 +12,7 @@ POST /v1/chat/completions) to the official zcode CLI via zcode_provider.run_prom
 Wire contract (the minimum a chat client needs):
   POST /v1/chat/completions   non-streaming JSON; stream=true -> single-chunk SSE
   GET  /v1/models             static single-model list
+  GET  /v1/events             NDJSON event stream (stream-json types, ring buffer)
   GET  /healthz               liveness + counters
 
 Mapping decisions (documented, evidence-first — verified end-to-end 2026-09-27):
@@ -21,7 +22,14 @@ Mapping decisions (documented, evidence-first — verified end-to-end 2026-09-27
 - session reuse: the adapter keeps ONE zcode sessionId in memory; the first turn
   creates it, later turns `--resume` it, so provider-side prompt caching applies
   across requests (note: current zcode CLI forks a new sessionId on --resume while
-  keeping cache hits).
+  keeping cache hits). A request may pass non-standard `"session": "new"` to fork
+  a fresh session (long-run job boundary).
+- long-run mode: requests may pass non-standard `"mode": "build"|"edit"|"plan"|"yolo"`
+  (official --mode values, arguments.ts:15); default from ZCODE_ADAPTER_MODE (yolo).
+  Invalid modes are rejected 400 before any spawn.
+- event stream: turns run through run_prompt_streaming(); every parsed stream-json
+  event lands in a bounded ring buffer exposed as NDJSON at GET /v1/events
+  (type/session/ok metadata only — no prompt or response content).
 - usage mapping: inputTokens->prompt_tokens, outputTokens->completion_tokens,
   totalTokens->total_tokens; cache/reasoning counters kept under `usage.zcode_usage`.
 
@@ -29,12 +37,14 @@ Credentials: none here. The adapter never reads ~/.zcode; the spawned zcode CLI 
 the user's own login state (same as GUI), which is the structural quota argument.
 
 Environment overrides: ZCODE_ADAPTER_HOST (default 127.0.0.1), ZCODE_ADAPTER_PORT
-(default 8123), ZCODE_ADAPTER_MODEL (default GLM-5.3), ZCODE_ADAPTER_CWD (default:
-directory the server was started from), ZCODE_ADAPTER_TIMEOUT (default 300 s).
+(default 8123), ZCODE_ADAPTER_MODEL (default GLM-5.3), ZCODE_ADAPTER_MODE (default
+yolo), ZCODE_ADAPTER_CWD (default: directory the server was started from),
+ZCODE_ADAPTER_TIMEOUT (default 300 s).
 """
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import threading
@@ -42,13 +52,18 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:  # package-relative import (providers.zcode) with same-dir fallback
-    from .zcode_provider import run_prompt  # type: ignore
+    from .zcode_provider import (  # type: ignore
+        DEFAULT_MODE, ZCODE_MODES, run_prompt_streaming, validate_mode,
+    )
 except ImportError:  # pragma: no cover - direct-script invocation
-    from zcode_provider import run_prompt  # type: ignore
+    from zcode_provider import (  # type: ignore
+        DEFAULT_MODE, ZCODE_MODES, run_prompt_streaming, validate_mode,
+    )
 
 HOST = os.environ.get("ZCODE_ADAPTER_HOST", "127.0.0.1")
 PORT = int(os.environ.get("ZCODE_ADAPTER_PORT", "8123"))
 MODEL_ID = os.environ.get("ZCODE_ADAPTER_MODEL", "GLM-5.3")
+ADAPTER_MODE = validate_mode(os.environ.get("ZCODE_ADAPTER_MODE", DEFAULT_MODE))
 CWD = os.environ.get("ZCODE_ADAPTER_CWD") or os.getcwd()
 TIMEOUT_S = int(os.environ.get("ZCODE_ADAPTER_TIMEOUT", "300"))
 
@@ -56,6 +71,17 @@ LOCK = threading.Lock()  # serialize zcode CLI turns (session resume is stateful
 
 STATE = {"session_id": None}
 STATS = {"requests": 0, "zcode_turns": 0, "errors": 0}
+EVENTS = collections.deque(maxlen=500)  # stream-json metadata ring (no content)
+
+
+def record_event(event, session_id="", ok=None):
+    """Append one stream-json event's metadata to the ring buffer (no content)."""
+    EVENTS.append({
+        "ts": time.time(),
+        "type": str(event.get("type")) if isinstance(event, dict) else "unknown",
+        "session_id": session_id,
+        **({} if ok is None else {"ok": bool(ok)}),
+    })
 
 
 def _content_to_text(content) -> str:
@@ -113,26 +139,49 @@ def zcode_usage_to_openai(usage: dict) -> dict:
 def handle_chat_completions(body: dict, *, turn_fn=None) -> dict:
     """One chat.completion through the zcode CLI.
 
-    ``turn_fn`` injects the zcode turn (tests fake it); default runs the real CLI.
+    ``turn_fn`` injects the zcode turn (tests fake it); default runs the real CLI
+    via run_prompt_streaming() so stream-json events feed the /v1/events ring.
     Returns an OpenAI completion dict, or {"__status": <int>, "__error": <str>}.
+
+    Non-standard (tolerated) request fields:
+      "mode": "build"|"edit"|"plan"|"yolo"  -> zcode --mode (400 on invalid)
+      "session": "new"                       -> fork a fresh zcode session
     """
     messages = body.get("messages") or []
     prompt, dropped_system = messages_to_prompt(messages)
     if not prompt:
         return {"__status": 400, "__error": "no usable (non-system) message content"}
 
+    try:
+        mode = validate_mode(body.get("mode", ADAPTER_MODE))
+    except ValueError as exc:
+        return {"__status": 400, "__error": str(exc)}
+    fork_new = body.get("session") == "new"
+
     with LOCK:
+        if fork_new:
+            STATE["session_id"] = None
         first = STATE["session_id"] is None
+        current_session = STATE["session_id"]
         if turn_fn is None:
-            def turn_fn(prompt, session_id, first_turn):  # noqa: E306
-                return run_prompt(
-                    prompt, cwd=CWD, timeout_s=TIMEOUT_S,
+            def turn_fn(prompt, session_id, first_turn, mode):  # noqa: E306
+                return run_prompt_streaming(
+                    prompt, cwd=CWD, timeout_s=TIMEOUT_S, mode=mode,
                     session_id=session_id, first_turn=first_turn,
+                    on_event=lambda ev: record_event(ev, session_id or ""),
                 )
-        res = turn_fn(prompt, STATE["session_id"], first)
+        res = turn_fn(prompt, current_session, first, mode)
         STATS["zcode_turns"] += 1
         if res.session_id:
             STATE["session_id"] = res.session_id
+        # single synthetic terminator per turn (live events already fed by on_event;
+        # injected turn_fns in tests carry empty raw_events, so no double-record)
+        EVENTS.append({
+            "ts": time.time(),
+            "type": "turn.completed",
+            "session_id": getattr(res, "session_id", "") or "",
+            "ok": bool(getattr(res, "ok", False)),
+        })
 
     if not res.ok:
         STATS["errors"] += 1
@@ -168,10 +217,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/healthz":
-            self._send_json({"ok": True, "zcode_session": STATE["session_id"], **STATS})
+            self._send_json({"ok": True, "zcode_session": STATE["session_id"],
+                             "mode": ADAPTER_MODE, "modes": list(ZCODE_MODES), **STATS})
         elif self.path.rstrip("/") == "/v1/models":
             self._send_json({"object": "list", "data": [
                 {"id": MODEL_ID, "object": "model", "owned_by": "zcode-adapter"}]})
+        elif self.path.rstrip("/") == "/v1/events":
+            # stream-json event ring as NDJSON (metadata only — no prompt/response content)
+            payload = "".join(
+                json.dumps(rec, ensure_ascii=False) + "\n" for rec in EVENTS
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
         else:
             self._send_json({"error": {"message": "not found"}}, 404)
 
@@ -226,8 +286,9 @@ def make_server(host: str = HOST, port: int = PORT) -> ThreadingHTTPServer:
 
 def main() -> int:
     server = make_server()
-    print("zcode B-1 adapter listening on http://{}:{} (model={})".format(
-        server.server_address[0], server.server_address[1], MODEL_ID), flush=True)
+    print("zcode B-1 adapter listening on http://{}:{} (model={}, mode={})".format(
+        server.server_address[0], server.server_address[1], MODEL_ID, ADAPTER_MODE),
+        flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

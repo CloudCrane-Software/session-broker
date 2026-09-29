@@ -11,6 +11,13 @@ Wire shape (evidence: zcode-app-cli 3.14.3 / repos/ZCode @ 29628c9):
       -> NDJSON events on stdout, terminator {"type":"result", sessionId,
          traceId, response, usage, projection}
 
+Long-run mode (线2 productization, 2026-09-29): ``--mode`` is now a first-class
+parameter — the official CLI accepts build/edit/plan/yolo (arguments.ts:15;
+headless prompt default is yolo, run.ts:42). ``run_prompt_streaming()`` adds an
+incremental NDJSON surface (Popen + per-event callback) so long-running turns
+can be observed while the CLI is still working — same wire format, just
+consumed live instead of after exit.
+
 Credentials: none here. The spawned zcode CLI uses the user's own login state
 (~/.zcode, BigModel OAuth), same as the GUI — that is the structural quota
 argument; this module never reads ~/.zcode.
@@ -35,6 +42,21 @@ INPUT_TEXT = "text"
 COMPLETION_NONE = "none"
 COMPLETION_MARKER_PREFIX = "marker:"
 
+# Official --mode values (repos/ZCode @ 29628c9, apps/zcode-cli/packages/cli/src
+# arguments.ts:15: `--mode build/edit/plan/yolo`; headless prompt default is
+# yolo per run.ts:42). yolo = unattended auto-approve (the long-run workhorse);
+# build = normal supervised; plan = read-only planning; edit = focused edits.
+ZCODE_MODES = ("build", "edit", "plan", "yolo")
+DEFAULT_MODE = "yolo"
+
+
+def validate_mode(mode):
+    # type: (object) -> str
+    """Return the validated mode string or raise ValueError (fail fast, 400 upstream)."""
+    if isinstance(mode, str) and mode in ZCODE_MODES:
+        return mode
+    raise ValueError("mode must be one of {} (got {!r})".format(list(ZCODE_MODES), mode))
+
 
 @dataclass(frozen=True)
 class CliAgentAdapter:
@@ -55,12 +77,15 @@ class CliAgentAdapter:
 # ZCode official CLI, headless. Evidence (zcode-app-cli 3.14.3):
 #   run.ts:42                  headless prompt default mode = yolo
 #   run.ts:115                 OUTPUT_FORMATS = ["text","json","stream-json"]
-#   arguments.ts               --resume <id> (resume_flag) / -c short continue
+#   arguments.ts:15            --mode build/edit/plan/yolo; --resume <id> / -c continue
 #   prompt-command.ts:328      "stream-json 的 result 是流的终止符"
 #   prompt-command.ts:347-359  terminator {"type":"result", sessionId, ...}
+# --mode is NOT baked into the base command: it is emitted per turn from the
+# validated `mode` parameter (DEFAULT_MODE="yolo" keeps the wire identical to
+# the 2026-09-26/27 verified baseline).
 ZCODE_ADAPTER = CliAgentAdapter(
     name="zcode",
-    command=("zcode", "--mode", "yolo", "--output-format", "stream-json"),
+    command=("zcode", "--output-format", "stream-json"),
     input_format=INPUT_TEXT,
     # zcode emits its own terminal result event; process exit / stdout EOF also ends turn.
     completion=COMPLETION_MARKER_PREFIX + '"type": "result"',
@@ -81,10 +106,13 @@ def build_turn_command(
     *,
     session_id: Optional[str] = None,
     first_turn: bool = True,
+    mode: str = DEFAULT_MODE,
     command_override: Optional[Tuple[str, ...]] = None,
 ) -> list:
     """Launch argv for one turn; later turns resume the persisted session."""
+    validated = validate_mode(mode)
     argv = list(command_override or ZCODE_ADAPTER.command)
+    argv += ["--mode", validated]
     if session_id and not first_turn and ZCODE_ADAPTER.resume_flag:
         argv += [ZCODE_ADAPTER.resume_flag, session_id]
     argv += [ZCODE_ADAPTER.prompt_flag, prompt]
@@ -180,6 +208,7 @@ def run_prompt(
     timeout_s: int = 180,
     session_id: Optional[str] = None,
     first_turn: bool = True,
+    mode: str = DEFAULT_MODE,
     log_path: Optional[str] = None,
     zcode_bin: Optional[str] = None,
     runner=None,
@@ -189,7 +218,11 @@ def run_prompt(
     ``runner`` injects a subprocess.run-alike (tests use it to fake the CLI);
     default is the real ``subprocess.run``.
     """
-    argv = build_turn_command(task, session_id=session_id, first_turn=first_turn)
+    try:
+        validated_mode = validate_mode(mode)
+    except ValueError as exc:
+        return ZcodeRunResult(ok=False, error=str(exc))
+    argv = build_turn_command(task, session_id=session_id, first_turn=first_turn, mode=validated_mode)
     binary = zcode_bin or shutil.which("zcode")
     if not binary:
         return ZcodeRunResult(ok=False, error="zcode binary not found on PATH")
@@ -240,10 +273,126 @@ def run_prompt(
     if log_path:
         payload = {
             # argv logged without the prompt text (task content stays out of logs)
-            "argv": [argv[0], ZCODE_ADAPTER.prompt_flag, "<task>",
-                     "--mode", "yolo", "--output-format", "stream-json"],
+            "argv": [argv[0], "--mode", validated_mode, "--output-format", "stream-json",
+                     ZCODE_ADAPTER.prompt_flag, "<task>"],
             "task_chars": len(task),
             "returncode": proc.returncode,
+            "duration_ms": result.duration_ms,
+            "stderr_tail": _mask(result.stderr_tail),
+            "events": _mask(events),
+        }
+        Path(log_path).write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    return result
+
+
+def run_prompt_streaming(
+    task: str,
+    *,
+    cwd: Optional[str] = None,
+    timeout_s: int = 180,
+    session_id: Optional[str] = None,
+    first_turn: bool = True,
+    mode: str = DEFAULT_MODE,
+    log_path: Optional[str] = None,
+    zcode_bin: Optional[str] = None,
+    popen=None,
+    on_event=None,
+) -> ZcodeRunResult:
+    """Same turn as run_prompt(), but NDJSON events are consumed live (Popen).
+
+    ``on_event(dict)`` fires for every parsed stream-json event while the CLI is
+    still running — the incremental surface long-running turns need (adapter
+    feeds it into an events ring buffer). Same terminator semantics: the
+    ``{"type":"result", ...}`` event closes the turn; stdout EOF / exit also do.
+
+    ``popen`` injects a subprocess.Popen-alike (tests fake the CLI process);
+    the fake needs .stdout (iterable of lines), .stderr (str), .wait() -> code,
+    .kill(). No shell; argv list only.
+    """
+    try:
+        validated_mode = validate_mode(mode)
+    except ValueError as exc:
+        return ZcodeRunResult(ok=False, error=str(exc))
+    argv = build_turn_command(task, session_id=session_id, first_turn=first_turn, mode=validated_mode)
+    binary = zcode_bin or shutil.which("zcode")
+    if not binary:
+        return ZcodeRunResult(ok=False, error="zcode binary not found on PATH")
+    argv[0] = binary
+
+    factory = popen or subprocess.Popen
+    started = time.monotonic()
+    result = ZcodeRunResult(ok=False)
+    proc = None
+    events = []
+    timed_out = False
+    try:
+        proc = factory(
+            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        deadline = started + timeout_s
+        for line in proc.stdout:  # blocks per line; deadline checked between lines
+            if time.monotonic() > deadline:
+                timed_out = True
+                proc.kill()
+                break
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                events.append(parsed)
+                if on_event is not None:
+                    on_event(parsed)
+        if not timed_out:
+            try:
+                returncode = proc.wait(timeout=max(1, int(deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                proc.kill()
+                returncode = proc.wait()
+            result.stderr_tail = (getattr(proc, "stderr", "") or "")[-2000:]
+    except Exception as exc:  # noqa: BLE001 — surface any spawn failure as turn error
+        result.duration_ms = int((time.monotonic() - started) * 1000)
+        result.error = "spawn failed: {}".format(exc)
+        if proc is not None and timed_out is False:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        return result
+    finally:
+        result.duration_ms = int((time.monotonic() - started) * 1000)
+
+    if timed_out:
+        result.error = "timeout after {}s (process killed)".format(timeout_s)
+        result.raw_events = events
+        result.event_types = [str(e.get("type")) for e in events]
+        return result
+
+    result.raw_events = events
+    result.event_types = [str(e.get("type")) for e in events]
+    final = next((e for e in reversed(events) if e.get("type") == "result"), None)
+    if final:
+        result.ok = returncode == 0
+        result.response = final.get("response", "")
+        result.session_id = final.get("sessionId", "")
+        result.trace_id = final.get("traceId", "")
+        result.usage = final.get("usage") or {}
+        result.projection = final.get("projection") or {}
+    else:
+        result.error = result.error or "no result event in stream-json output"
+    result.provider_id, result.model = _extract_model(events)
+
+    if log_path:
+        payload = {
+            "argv": [argv[0], "--mode", validated_mode, "--output-format", "stream-json",
+                     ZCODE_ADAPTER.prompt_flag, "<task>"],
+            "task_chars": len(task),
+            "returncode": returncode,
             "duration_ms": result.duration_ms,
             "stderr_tail": _mask(result.stderr_tail),
             "events": _mask(events),
@@ -269,6 +418,9 @@ class ZcodeHarness:
             "checkpoint": False,
             "steer": False,
             "abort": False,
+            # 线2: long-run modes are a launch parameter, not a resident process feature.
+            "modes": list(ZCODE_MODES),
+            "stream_events": True,
         },
     }
 
@@ -276,21 +428,40 @@ class ZcodeHarness:
         self._config = dict(config or {})
         self.session_id = None  # type: Optional[str]
         self._log = []
+        self._stream_events = []  # raw stream-json dicts from the latest turn
 
-    def turn(self, content: str, *, timeout_s: int = 180) -> dict:
+    def turn(self, content: str, *, timeout_s: int = 180, mode: Optional[str] = None,
+             stream: bool = False) -> dict:
+        """One turn; ``mode`` overrides the harness config for this turn.
+
+        ``stream=True`` uses the incremental Popen surface (run_prompt_streaming)
+        and records the raw event dicts on ``.stream_events`` — for long-running
+        turns that want live observation.
+        """
         first = self.session_id is None
-        res = run_prompt(
-            content,
+        run_kwargs = dict(
             timeout_s=timeout_s,
             session_id=self.session_id,
             first_turn=first,
+            mode=self._config.get("mode", DEFAULT_MODE) if mode is None else mode,
             cwd=self._config.get("cwd"),
             log_path=self._config.get("log_path"),
+            zcode_bin=self._config.get("zcode_bin"),
         )
+        if stream:
+            self._stream_events = []
+            res = run_prompt_streaming(content, on_event=self._stream_events.append, **run_kwargs)
+        else:
+            res = run_prompt(content, **run_kwargs)
         if res.session_id:
             self.session_id = res.session_id
         self._log.append(res.to_provider_result())
         return res.to_provider_result()
+
+    @property
+    def last_stream_events(self):
+        """Raw stream-json dicts from the latest ``turn(..., stream=True)`` call."""
+        return list(self._stream_events)
 
     # -- ExternalHarnessProtocol surface (duck-typed) --
     def start(self, context: Optional[dict] = None) -> None:
